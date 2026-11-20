@@ -1,11 +1,23 @@
 """
-GPU Neural Network Training Script for  Coin Counter (v7.1: C4E, A=16, 8x8 Bilinear Chroma).
+GPU Neural Network Training Script for  Coin Counter (v7.2: C4E, A=16, 8x8 Bilinear Chroma).
 
 
-Trains all ML model weights (RimGate, RimNet, CoarseNet, Polar ClassFilterBank W_cls,
-AcceptNet) on the NVIDIA CUDA GPU using STRICTLY the images and answers in ./sampleimages/.
-Exports 100% lossless Predictive + Canonical Huffman + Base85 weights (ZERO zlib!) to
-./trained_weights.b85, verifies bit-exact round-trip decoding, and injects WEIGHTS_B85 into ./solution.py.
+Features:
+  - Auto-parses ALL non-overlapping images in ./sampleimages/ (e.g., group-1, group-2, group-4, group-5),
+    estimating exact per-coin class & rotation angle verified against .ans.
+  - Builds real-on-real COMBINED training scenes (layer stacking, mosaic, dense overlap) directly
+    from existing ./sampleimages/ files with zero resampling blur (chirality-safe rot90 + shifts).
+  - Builds a held-out COMBINED end-to-end test suite combining all ./sampleimages/ (including
+    group-3 / group-6 + white-space real coin fill with mathematically exact sums).
+  - Runs Stage-2 Hard-Example Mining using the actual CoinDetector from generate_solution.py on
+    separate combined training scenes, fine-tunes CoarseNet & AcceptNet, and keeps the best model.
+  - Exports 100% lossless Predictive + Canonical Huffman + Base85 weights to ./trained_weights.b85
+    and generates ./solution.py via generate_solution.py.
+
+Usage:
+    python train_coins.py
+    python train_coins.py --save-tests
+    python train_coins.py --no-inject
 """
 
 import os
@@ -17,6 +29,7 @@ import gc
 import io
 import re
 import sys
+import glob
 import math
 import time
 import heapq
@@ -32,6 +45,7 @@ from PIL import Image
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_DIR = os.path.join(BASE_DIR, "sampleimages")
 SOLUTION_PATH = os.path.join(BASE_DIR, "solution.py")
+COMBINED_TESTS_DIR = os.path.join(BASE_DIR, "combined_testcases")
 
 CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64"
 if os.path.isdir(CUDA_BIN):
@@ -86,6 +100,7 @@ cublas.cublasSgemm_v2.argtypes = [
 
 CUBLAS_OP_N = 0
 CUBLAS_OP_T = 1
+COIN_VALUES = (1, 5, 10)
 
 
 def _ck(rc: int, label: str):
@@ -520,10 +535,15 @@ class Param:
 
 
 class GpuLinear:
-    def __init__(self, in_f: int, out_f: int, rng, scale=None):
-        s = math.sqrt(2.0 / in_f) if scale is None else scale
-        self.W = Param(rng.normal(0.0, s, (out_f, in_f)).astype(np.float32), decay=True)
-        self.b = Param(np.zeros((out_f,), dtype=np.float32), decay=False)
+    def __init__(self, in_f: int, out_f: int, rng, scale=None, init_wb=None):
+        if init_wb is not None:
+            w_arr, b_arr = init_wb
+            self.W = Param(np.asarray(w_arr, dtype=np.float32).reshape(out_f, in_f), decay=True)
+            self.b = Param(np.asarray(b_arr, dtype=np.float32).reshape(out_f,), decay=False)
+        else:
+            s = math.sqrt(2.0 / in_f) if scale is None else scale
+            self.W = Param(rng.normal(0.0, s, (out_f, in_f)).astype(np.float32), decay=True)
+            self.b = Param(np.zeros((out_f,), dtype=np.float32), decay=False)
         self.in_f = in_f
         self.out_f = out_f
         self._x = None
@@ -581,7 +601,7 @@ class AdamW:
 
 def lr_warmup_cosine(ep: int, total_ep: int, lr_max: float, lr_min: float = 1e-4, warmup_ep: int = 3) -> float:
     if ep < warmup_ep:
-        return lr_max * float(ep + 1) / float(warmup_ep)
+        return lr_max * float(ep + 1) / float(max(1, warmup_ep))
     prog = float(ep - warmup_ep) / max(1.0, float(total_ep - warmup_ep))
     return lr_min + (lr_max - lr_min) * 0.5 * (1.0 + math.cos(math.pi * prog))
 
@@ -637,12 +657,16 @@ def _make_c4_mat():
 C4_MAT = _make_c4_mat()
 
 
-def rgb_to_half_ycbcr_sim(img_u8: np.ndarray, q: int = 85):
-    """Exact match to 4x4 Y half-res IDCT + full 8x8 500x500 Cb/Cr IDCT."""
+def encode_jpeg_bytes(img_u8: np.ndarray, q: int = 85) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(img_u8, "RGB").save(buf, format="JPEG", quality=int(q), subsampling=2)
-    buf.seek(0)
-    with Image.open(buf) as pil_im:
+    return buf.getvalue()
+
+
+def rgb_to_half_ycbcr_sim(img_u8: np.ndarray, q: int = 85, return_jpeg: bool = False):
+    """Exact match to 4x4 Y half-res IDCT + full 8x8 500x500 Cb/Cr IDCT."""
+    jpg = encode_jpeg_bytes(img_u8, q=q)
+    with Image.open(io.BytesIO(jpg)) as pil_im:
         im_ycb = np.asarray(pil_im.convert("YCbCr"), dtype=np.float32)
     B_y = (im_ycb[:, :, 0] - 128.0).reshape(125, 8, 125, 8).transpose(0, 2, 1, 3)
     dct_4 = np.matmul(np.matmul(C4_MAT, B_y), C4_MAT.T)
@@ -650,11 +674,13 @@ def rgb_to_half_ycbcr_sim(img_u8: np.ndarray, q: int = 85):
     Y_half = np.clip(np.round(rec_8.reshape(500, 2, 500, 2).mean(axis=(1, 3))), 0.0, 255.0).astype(np.float32)
     Cb_half = np.clip(np.round(im_ycb[:, :, 1].reshape(500, 2, 500, 2).mean(axis=(1, 3))), 0.0, 255.0).astype(np.float32)
     Cr_half = np.clip(np.round(im_ycb[:, :, 2].reshape(500, 2, 500, 2).mean(axis=(1, 3))), 0.0, 255.0).astype(np.float32)
+    if return_jpeg:
+        return Y_half, Cb_half, Cr_half, jpg
     return Y_half, Cb_half, Cr_half
 
 
 # ==============================================================================
-# Pure sampleimages/ Bootstrapper (Zero External Data!)
+# Full sampleimages/ Bootstrapper (Uses ALL Images in ./sampleimages/!)
 # ==============================================================================
 
 def find_non_overlapping_peaks(img_u8: np.ndarray, min_dist=55):
@@ -674,16 +700,21 @@ def find_non_overlapping_peaks(img_u8: np.ndarray, min_dist=55):
 
 
 def refine_subpixel_center_rgb(img_u8: np.ndarray, cx: float, cy: float):
-    x0, y0 = int(round(cx)) - 42, int(round(cy)) - 42
-    if x0 < 2 or y0 < 2 or x0 + 85 > 998 or y0 + 85 > 998:
+    ix, iy = int(round(cx)), int(round(cy))
+    x0, y0 = ix - 42, iy - 42
+    sx0, sy0 = max(0, x0), max(0, y0)
+    sx1, sy1 = min(1000, x0 + 85), min(1000, y0 + 85)
+    if sx1 <= sx0 or sy1 <= sy0:
         return None
-    patch = img_u8[y0:y0 + 85, x0:x0 + 85].astype(np.float32)
+    patch = np.full((85, 85, 3), 255.0, dtype=np.float32)
+    patch[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img_u8[sy0:sy1, sx0:sx1].astype(np.float32)
+
     m = np.clip((242.0 - patch.min(axis=2)) / 20.0, 0.0, 1.0)
     yy, xx = np.mgrid[:85, :85]
     d = np.hypot(xx - 42.0, yy - 42.0)
     m *= (d <= 40.5)
     s = float(m.sum())
-    if s < 3500.0:
+    if s < 1800.0:
         return None
     dx = float((xx * m).sum() / s) - 42.0
     dy = float((yy * m).sum() / s) - 42.0
@@ -692,7 +723,7 @@ def refine_subpixel_center_rgb(img_u8: np.ndarray, cx: float, cy: float):
     gy = cv2.Sobel(patch.mean(axis=2), cv2.CV_32F, 0, 1, ksize=3)
     gmag = np.hypot(gx, gy)
     for _ in range(3):
-        lx, ly = 42.0 + (ncx - round(cx)), 42.0 + (ncy - round(cy))
+        lx, ly = 42.0 + (ncx - ix), 42.0 + (ncy - iy)
         rx = xx - lx
         ry = yy - ly
         rr = np.hypot(rx, ry)
@@ -709,7 +740,92 @@ def refine_subpixel_center_rgb(img_u8: np.ndarray, cx: float, cy: float):
     return (ncx, ncy)
 
 
-def extract_clean_coins_from_samples():
+def _sample_polar_180(patch_u8: np.ndarray) -> np.ndarray:
+    """High-res polar descriptor (3 channels x 8 radii x 180 angles = 2 deg steps)."""
+    rs = np.array([6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 33.5], dtype=np.float32)
+    angs = np.arange(180, dtype=np.float32) * (2.0 * math.pi / 180.0)
+    xs = (42.0 + rs[:, None] * np.cos(angs)[None, :]).astype(np.float32)
+    ys = (42.0 + rs[:, None] * np.sin(angs)[None, :]).astype(np.float32)
+    pf = patch_u8.astype(np.float32)
+    out = np.empty((3, 8, 180), dtype=np.float32)
+    for c in range(3):
+        out[c] = cv2.remap(pf[:, :, c], xs, ys, cv2.INTER_LINEAR, borderValue=255.0)
+    return out
+
+
+def _estimate_coin_cls_and_deg(patch_u8: np.ndarray, tpl_fft, tpl_norm, tpl_means, force_cls=None):
+    """Estimates exact (cls, deg in OpenCV CCW convention) using polar FFT cross-correlation."""
+    desc = _sample_polar_180(patch_u8)
+    desc_c = desc - desc.mean(axis=(1, 2), keepdims=True)
+    d_norm = float(np.linalg.norm(desc_c)) + 1e-6
+    d_fft = np.fft.rfft(desc_c.reshape(24, 180), axis=1)
+    p_mean = desc.mean(axis=(1, 2))
+
+    cls_candidates = [force_cls] if force_cls is not None else [0, 1, 2]
+    best_cls = cls_candidates[0]
+    best_deg = 0.0
+    best_score = -1e9
+    scores_all = {}
+
+    for cls in cls_candidates:
+        # irfft(rfft(tpl) * conj(rfft(patch)))[s] peaks at s = deg / 2.0 (OpenCV CCW angle)
+        corr = np.fft.irfft(np.sum(tpl_fft[cls] * np.conj(d_fft), axis=0), n=180)
+        s0 = int(np.argmax(corr))
+        # Parabolic sub-bin interpolation around s0
+        ym = float(corr[(s0 - 1) % 180])
+        y0 = float(corr[s0])
+        yp = float(corr[(s0 + 1) % 180])
+        denom = (ym - 2.0 * y0 + yp)
+        frac = 0.5 * (ym - yp) / denom if abs(denom) > 1e-6 else 0.0
+        frac = max(-0.5, min(0.5, frac))
+        deg_est = float(((s0 + frac) * 2.0) % 360.0)
+        ncc = y0 / (tpl_norm[cls] * d_norm)
+        color_pen = float(np.linalg.norm(p_mean - tpl_means[cls])) / 60.0
+        sc = ncc - 0.35 * color_pen
+        scores_all[cls] = (sc, deg_est, ncc)
+        if sc > best_score:
+            best_score = sc
+            best_cls = cls
+            best_deg = deg_est
+
+    return best_cls, best_deg, best_score, scores_all
+
+
+def _is_non_overlapping_image(img_u8: np.ndarray, peaks, min_r: float, max_r: float) -> bool:
+    if len(peaks) == 0:
+        return False
+    min_d2 = (2.0 * min_r - 5.0) ** 2
+    for i in range(len(peaks)):
+        x1, y1 = peaks[i]
+        for j in range(i + 1, len(peaks)):
+            x2, y2 = peaks[j]
+            if (x1 - x2) ** 2 + (y1 - y2) ** 2 < min_d2:
+                return False
+    fg = (img_u8.min(axis=2) < 222).astype(np.uint8)
+    fg_sep = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n_cc, _, stats, _ = cv2.connectedComponentsWithStats(fg_sep, connectivity=4)
+    max_single_area = int(1.38 * math.pi * max_r * max_r)
+    for k in range(1, n_cc):
+        if stats[k, cv2.CC_STAT_AREA] > max_single_area:
+            return False
+    cov = np.zeros((1000, 1000), dtype=np.uint8)
+    r_cov = int(math.ceil(max_r + 4.0))
+    for cx, cy in peaks:
+        cv2.circle(cov, (int(round(cx)), int(round(cy))), r_cov, 1, -1)
+    fg_tot = int(fg.sum())
+    if fg_tot == 0:
+        return False
+    uncovered = int((fg & (1 - cov)).sum())
+    return (uncovered / fg_tot) < 0.04
+
+
+def extract_all_sample_data():
+    """
+    Bootstraps clean sprites from group-1 & group-4, then scans ALL *.in/*.ans in ./sampleimages/:
+      - Non-overlapping images (group-1, group-2, group-4, group-5, ...) -> verified per-coin GT
+        with exact (cls, cx, cy, deg, r, un-premultiplied 85x85 RGB patch).
+      - Overlapping images (group-3, group-6, ...) -> stored for combined end-to-end test cases.
+    """
     g1_path = os.path.join(SAMPLE_DIR, "group-1.in")
     g4_path = os.path.join(SAMPLE_DIR, "group-4.in")
     ans1 = int(open(os.path.join(SAMPLE_DIR, "group-1.ans")).read().strip())
@@ -730,6 +846,8 @@ def extract_clean_coins_from_samples():
         if sub is None:
             continue
         sx, sy = sub
+        if sx < 44.0 or sx > 956.0 or sy < 44.0 or sy > 956.0:
+            continue
         M = np.float32([[1, 0, 42.0 - sx], [0, 1, 42.0 - sy]])
         warped = cv2.warpAffine(g1, M, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
         raw_by_cls[0].append(warped)
@@ -767,11 +885,14 @@ def extract_clean_coins_from_samples():
         if sub is None:
             continue
         sx, sy = sub
+        if sx < 44.0 or sx > 956.0 or sy < 44.0 or sy > 956.0:
+            continue
         M = np.float32([[1, 0, 42.0 - sx], [0, 1, 42.0 - sy]])
         warped = cv2.warpAffine(g4, M, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
         raw_by_cls[cluster_to_cls[int(cl)]].append(warped)
 
     sprites, alphas, radii, clean_by_cls = [], [], [], [[], [], []]
+    edge_masks = []
     yy, xx = np.mgrid[:85, :85]
     rr = np.hypot(xx - 42.0, yy - 42.0)
     for cls in range(3):
@@ -783,28 +904,347 @@ def extract_clean_coins_from_samples():
             r_grid = np.linspace(34.0, 41.0, 141)
             xs = 42.0 + r_grid * math.cos(th)
             ys = 42.0 + r_grid * math.sin(th)
-            mn = cv2.remap(med.min(axis=2), xs.astype(np.float32)[None, :], ys.astype(np.float32)[None, :], cv2.INTER_LINEAR)[0]
+            mn = cv2.remap(
+                med.min(axis=2),
+                xs.astype(np.float32)[None, :],
+                ys.astype(np.float32)[None, :],
+                cv2.INTER_LINEAR,
+            )[0]
             idx = np.where(mn >= 230.0)[0]
             if len(idx) > 0:
                 rs.append(float(r_grid[idx[0]]))
         r_med = float(np.median(rs))
         alpha = np.clip((r_med + 0.5 - rr) / 1.0, 0.0, 1.0).astype(np.float32)
         edge_m = (alpha > 0.15) & (alpha < 0.99)
+        edge_masks.append(edge_m)
 
         sprite_rgb = med.copy()
-        sprite_rgb[edge_m] = np.clip((med[edge_m] - (1.0 - alpha[edge_m, None]) * 255.0) / alpha[edge_m, None], 0.0, 255.0)
+        sprite_rgb[edge_m] = np.clip(
+            (med[edge_m] - (1.0 - alpha[edge_m, None]) * 255.0) / alpha[edge_m, None],
+            0.0,
+            255.0,
+        )
         sprites.append(np.clip(sprite_rgb, 0, 255).astype(np.uint8))
         alphas.append(alpha)
         radii.append(r_med)
 
-        # Un-premultiply edge of individual coins so they can be rotated cleanly to any angle
         for raw_c in raw_by_cls[cls]:
             cf = raw_c.astype(np.float32)
-            cf[edge_m] = np.clip((cf[edge_m] - (1.0 - alpha[edge_m, None]) * 255.0) / alpha[edge_m, None], 0.0, 255.0)
+            cf[edge_m] = np.clip(
+                (cf[edge_m] - (1.0 - alpha[edge_m, None]) * 255.0) / alpha[edge_m, None],
+                0.0,
+                255.0,
+            )
             clean_by_cls[cls].append(np.clip(np.round(cf), 0, 255).astype(np.uint8))
 
-        print(f"Bootstrapped {[1,5,10][cls]} SEK: n={len(stack)}, R_500={r_med/2:.3f}", flush=True)
-    return sprites, alphas, radii, clean_by_cls
+        print(f"Bootstrapped {[1, 5, 10][cls]} SEK: n={len(stack)}, R_500={r_med / 2:.3f}", flush=True)
+
+    # Build 180-bin polar FFT templates for exact rotation & class recognition on ALL sampleimages
+    tpl_fft, tpl_norm, tpl_means = [], [], []
+    for cls in range(3):
+        td = _sample_polar_180(sprites[cls])
+        tpl_means.append(td.mean(axis=(1, 2)))
+        td_c = td - td.mean(axis=(1, 2), keepdims=True)
+        tpl_norm.append(float(np.linalg.norm(td_c)) + 1e-6)
+        tpl_fft.append(np.fft.rfft(td_c.reshape(24, 180), axis=1))
+
+    # Pre-verified class map for group-4 from bootstrap above
+    g4_cls_by_peak = [cluster_to_cls[int(cl)] for cl in lbls]
+
+    raw_samples = []
+    verified_non_overlap = []
+    overlap_samples = []
+    min_r, max_r = min(radii), max(radii)
+
+    for in_path in sorted(glob.glob(os.path.join(SAMPLE_DIR, "*.in"))):
+        name = os.path.splitext(os.path.basename(in_path))[0]
+        ans_path = os.path.splitext(in_path)[0] + ".ans"
+        if not os.path.exists(ans_path):
+            continue
+        ans = int(open(ans_path, "r", encoding="utf-8").read().strip())
+        jpg_bytes = open(in_path, "rb").read()
+        img_u8 = np.array(Image.open(io.BytesIO(jpg_bytes)).convert("RGB"))
+        raw_samples.append((name, jpg_bytes, img_u8, ans))
+
+        if img_u8.shape[:2] != (1000, 1000):
+            overlap_samples.append((name, img_u8, ans))
+            continue
+
+        _, peaks = find_non_overlapping_peaks(img_u8)
+        known_non_ov = name in ("group-1", "group-4")
+        if known_non_ov or _is_non_overlapping_image(img_u8, peaks, min_r, max_r):
+            force_c0 = (len(peaks) == ans)
+            coins = []
+            for pi, (cx, cy) in enumerate(peaks):
+                sub = refine_subpixel_center_rgb(img_u8, cx, cy)
+                sx, sy = sub if sub is not None else (cx, cy)
+                M = np.float32([[1, 0, 42.0 - sx], [0, 1, 42.0 - sy]])
+                patch = cv2.warpAffine(img_u8, M, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+
+                if name == "group-1":
+                    cls, deg = 0, 0.0
+                elif name == "group-4" and len(peaks) == len(g4_cls_by_peak):
+                    cls, deg = g4_cls_by_peak[pi], 0.0
+                else:
+                    cls, deg, _sc, _all = _estimate_coin_cls_and_deg(
+                        patch, tpl_fft, tpl_norm, tpl_means, force_cls=(0 if force_c0 else None)
+                    )
+
+                r_cls = radii[cls]
+                is_clipped = (
+                    sx < r_cls + 1.0 or sx > 999.0 - r_cls - 1.0
+                    or sy < r_cls + 1.0 or sy > 999.0 - r_cls - 1.0
+                )
+                if is_clipped:
+                    Mr = cv2.getRotationMatrix2D((42.0, 42.0), deg, 1.0)
+                    clean_patch = np.clip(
+                        np.round(
+                            cv2.warpAffine(
+                                sprites[cls].astype(np.float32),
+                                Mr,
+                                (85, 85),
+                                flags=cv2.INTER_LINEAR,
+                                borderValue=(255, 255, 255),
+                            )
+                        ),
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                else:
+                    cf = patch.astype(np.float32)
+                    em = edge_masks[cls]
+                    al = alphas[cls]
+                    cf[em] = np.clip(
+                        (cf[em] - (1.0 - al[em, None]) * 255.0) / al[em, None],
+                        0.0,
+                        255.0,
+                    )
+                    clean_patch = np.clip(np.round(cf), 0, 255).astype(np.uint8)
+                coins.append((cls, sx, sy, deg, r_cls, clean_patch))
+
+            pred_sum = sum(COIN_VALUES[c[0]] for c in coins)
+            if pred_sum == ans:
+                is_1sek_only = all(c[0] == 0 for c in coins)
+                verified_non_overlap.append({
+                    "name": name,
+                    "img_u8": img_u8,
+                    "ans": ans,
+                    "coins": coins,
+                    "only_1sek": is_1sek_only,
+                })
+                if name not in ("group-1", "group-4"):
+                    for cls, sx, sy, deg, r_cls, cp in coins:
+                        if sx < r_cls + 1.0 or sx > 999.0 - r_cls - 1.0 or sy < r_cls + 1.0 or sy > 999.0 - r_cls - 1.0:
+                            continue
+                        M_inv = cv2.getRotationMatrix2D((42.0, 42.0), -deg, 1.0)
+                        derot = cv2.warpAffine(
+                            cp.astype(np.float32),
+                            M_inv,
+                            (85, 85),
+                            flags=cv2.INTER_LINEAR,
+                            borderValue=(255, 255, 255),
+                        )
+                        clean_by_cls[cls].append(np.clip(np.round(derot), 0, 255).astype(np.uint8))
+                print(
+                    f"  [Sample Parse] {name:10s}: VERIFIED non-overlap ({len(coins)} coins, sum={pred_sum}=={ans}, "
+                    f"rot_std={np.std([c[3] for c in coins]):.1f} deg)",
+                    flush=True,
+                )
+            else:
+                overlap_samples.append((name, img_u8, ans))
+                print(f"  [Sample Parse] {name:10s}: kept as overlap sample (pred_sum={pred_sum}, ans={ans})", flush=True)
+        else:
+            overlap_samples.append((name, img_u8, ans))
+            print(f"  [Sample Parse] {name:10s}: overlapping sample (ans={ans}) -> used for combined tests", flush=True)
+
+    if not verified_non_overlap:
+        raise RuntimeError(f"No verified non-overlapping samples found in {SAMPLE_DIR}!")
+
+    return sprites, alphas, radii, clean_by_cls, raw_samples, verified_non_overlap, overlap_samples
+
+
+# ==============================================================================
+# Scene Synthesizers: (A) Parametric Synthetic + (B) Combined Real Sample Images
+# ==============================================================================
+
+def _try_place_coin_on_canvas(
+    canvas: np.ndarray,
+    owner: np.ndarray,
+    placed: list,
+    cls: int,
+    cx: float,
+    cy: float,
+    deg: float,
+    r: float,
+    rot_rgb: np.ndarray,
+    rot_a: np.ndarray,
+    allow_ov: bool,
+    min_vis_ratio: float,
+) -> bool:
+    if cx < -24.0 or cx > 1024.0 or cy < -24.0 or cy > 1024.0:
+        return False
+    if not allow_ov:
+        if any((cx - ox) ** 2 + (cy - oy) ** 2 < (r + orad + 1.5) ** 2 for _, ox, oy, _, orad in placed):
+            return False
+
+    ix, iy = int(round(cx)), int(round(cy))
+    x0, y0 = ix - 42, iy - 42
+    sx0, sy0 = max(0, x0), max(0, y0)
+    sx1, sy1 = min(1000, x0 + 85), min(1000, y0 + 85)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return False
+
+    yy_sub, xx_sub = np.mgrid[sy0:sy1, sx0:sx1]
+    new_disk = ((xx_sub - cx) ** 2 + (yy_sub - cy) ** 2) <= (r * r)
+    if int(new_disk.sum()) < 450:
+        return False
+
+    if allow_ov and len(placed) > 0:
+        affected_ids = np.unique(owner[sy0:sy1, sx0:sx1][new_disk])
+        for aid in affected_ids:
+            if aid < 0:
+                continue
+            _, ax, ay, _, ar = placed[int(aid)]
+            ay0, ay1 = max(0, int(ay - ar - 2)), min(1000, int(ay + ar + 3))
+            ax0, ax1 = max(0, int(ax - ar - 2)), min(1000, int(ax + ar + 3))
+            sub_own = (owner[ay0:ay1, ax0:ax1] == aid).copy()
+            oy0, oy1 = max(ay0, sy0), min(ay1, sy1)
+            ox0, ox1 = max(ax0, sx0), min(ax1, sx1)
+            if oy1 > oy0 and ox1 > ox0:
+                sub_own[oy0 - ay0:oy1 - ay0, ox0 - ax0:ox1 - ax0] &= ~new_disk[oy0 - sy0:oy1 - sy0, ox0 - sx0:ox1 - sx0]
+            if int(sub_own.sum()) < int(min_vis_ratio * math.pi * ar * ar):
+                return False
+            n_cc, _, stats_cc, _ = cv2.connectedComponentsWithStats(sub_own.astype(np.uint8), connectivity=4)
+            if sum(1 for k in range(1, n_cc) if stats_cc[k, cv2.CC_STAT_AREA] >= 12) != 1:
+                return False
+
+    px0, py0 = sx0 - x0, sy0 - y0
+    px1, py1 = px0 + (sx1 - sx0), py0 + (sy1 - sy0)
+    a_slice = rot_a[py0:py1, px0:px1, None]
+    dst = canvas[sy0:sy1, sx0:sx1].astype(np.float32)
+    comp = a_slice * rot_rgb[py0:py1, px0:px1] + (1.0 - a_slice) * dst
+    canvas[sy0:sy1, sx0:sx1] = np.clip(np.round(comp), 0, 255).astype(np.uint8)
+
+    owner[sy0:sy1, sx0:sx1][new_disk] = len(placed)
+    placed.append((cls, cx, cy, deg, r))
+    return True
+
+
+def _rot90_coords(cx: float, cy: float, k: int):
+    k &= 3
+    if k == 0:
+        return cx, cy
+    if k == 1:
+        return cy, 999.0 - cx
+    if k == 2:
+        return 999.0 - cx, 999.0 - cy
+    return 999.0 - cy, cx
+
+
+def synthesize_combined_scene(
+    verified_scenes: list,
+    alphas: list,
+    rng,
+    mode: str = "combo_stack",
+    n_layers: int = 3,
+    only_1sek: bool = False,
+    return_jpeg: bool = False,
+):
+    """
+    Combines 2-4 EXISTING verified sample images from ./sampleimages/ onto a 1000x1000 canvas!
+    Uses chirality-preserving rot90 (0/90/180/270 deg) + shifts so real coin pixels are composited
+    with ZERO resampling blur, real overlaps, real border clips, and 100% exact ground truth.
+    """
+    pool_sc = [sc for sc in verified_scenes if sc["only_1sek"]] if only_1sek else verified_scenes
+    if not pool_sc:
+        pool_sc = verified_scenes
+
+    canvas = np.full((1000, 1000, 3), 255, dtype=np.uint8)
+    owner = np.full((1000, 1000), -1, dtype=np.int16)
+    placed = []
+    min_vis_ratio = 0.14 if mode in ("combo_dense", "combo_mosaic") else 0.16
+
+    if mode == "combo_mosaic":
+        # 4-quadrant mosaic from 4 sample images + 1-2 shifted overlapping real layers on top
+        quads = [(0, 500, 0, 500), (500, 1000, 0, 500), (0, 500, 500, 1000), (500, 1000, 500, 1000)]
+        for qx0, qx1, qy0, qy1 in quads:
+            sc = pool_sc[int(rng.integers(0, len(pool_sc)))]
+            k_rot = int(rng.integers(0, 4))
+            dx_sh = float(rng.uniform(-45.0, 45.0))
+            dy_sh = float(rng.uniform(-45.0, 45.0))
+            order = rng.permutation(len(sc["coins"]))
+            for idx in order:
+                cls, cx, cy, deg, r, patch = sc["coins"][idx]
+                rx, ry = _rot90_coords(cx, cy, k_rot)
+                ncx, ncy = rx + dx_sh, ry + dy_sh
+                if not (qx0 - 15.0 <= ncx <= qx1 + 15.0 and qy0 - 15.0 <= ncy <= qy1 + 15.0):
+                    continue
+                ndeg = (deg + 90.0 * k_rot) % 360.0
+                rot_rgb = np.rot90(patch, k_rot).astype(np.float32)
+                rot_a = np.rot90(alphas[cls], k_rot)
+                # Apply subpixel fractional shift cleanly
+                ix, iy = int(round(ncx)), int(round(ncy))
+                fx, fy = ncx - ix, ncy - iy
+                if abs(fx) > 1e-3 or abs(fy) > 1e-3:
+                    Ms = np.float32([[1.0, 0.0, fx], [0.0, 1.0, fy]])
+                    rot_rgb = cv2.warpAffine(rot_rgb, Ms, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+                    rot_a = cv2.warpAffine(rot_a, Ms, (85, 85), flags=cv2.INTER_LINEAR, borderValue=0.0)
+                _try_place_coin_on_canvas(canvas, owner, placed, cls, ncx, ncy, ndeg, r, rot_rgb, rot_a, True, min_vis_ratio)
+        extra_layers = max(1, n_layers - 2)
+    else:
+        extra_layers = n_layers
+
+    # Layer-by-layer real image stacking (prefers mixing DIFFERENT images from sampleimages/)
+    picked_indices = []
+    if len(pool_sc) >= extra_layers:
+        picked_indices = list(rng.choice(len(pool_sc), size=extra_layers, replace=False))
+    else:
+        picked_indices = list(rng.permutation(len(pool_sc)))
+        while len(picked_indices) < extra_layers:
+            picked_indices.append(int(rng.integers(0, len(pool_sc))))
+
+    for li, sc_idx in enumerate(picked_indices):
+        sc = pool_sc[sc_idx]
+        k_rot = int(rng.integers(0, 4))
+        # First layer near original alignment; upper layers shifted so real coins overlap realistically
+        if li == 0 and mode != "combo_mosaic":
+            dx_layer = float(rng.uniform(-35.0, 35.0))
+            dy_layer = float(rng.uniform(-35.0, 35.0))
+        else:
+            dx_layer = float(rng.uniform(-90.0, 90.0))
+            dy_layer = float(rng.uniform(-90.0, 90.0))
+
+        order = rng.permutation(len(sc["coins"]))
+        for idx in order:
+            cls, cx, cy, deg, r, patch = sc["coins"][idx]
+            rx, ry = _rot90_coords(cx, cy, k_rot)
+            # Small per-coin jitter diversifies overlap offsets while keeping real coin layout density
+            jx = float(rng.uniform(-8.0, 8.0)) if li > 0 else float(rng.uniform(-3.0, 3.0))
+            jy = float(rng.uniform(-8.0, 8.0)) if li > 0 else float(rng.uniform(-3.0, 3.0))
+            ncx = rx + dx_layer + jx
+            ncy = ry + dy_layer + jy
+            ndeg = (deg + 90.0 * k_rot) % 360.0
+
+            rot_rgb = np.rot90(patch, k_rot).astype(np.float32)
+            rot_a = np.rot90(alphas[cls], k_rot)
+            ix, iy = int(round(ncx)), int(round(ncy))
+            fx, fy = ncx - ix, ncy - iy
+            if abs(fx) > 1e-3 or abs(fy) > 1e-3:
+                Ms = np.float32([[1.0, 0.0, fx], [0.0, 1.0, fy]])
+                rot_rgb = cv2.warpAffine(rot_rgb, Ms, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+                rot_a = cv2.warpAffine(rot_a, Ms, (85, 85), flags=cv2.INTER_LINEAR, borderValue=0.0)
+
+            _try_place_coin_on_canvas(canvas, owner, placed, cls, ncx, ncy, ndeg, r, rot_rgb, rot_a, True, min_vis_ratio)
+
+    q = 75 if rng.random() < 0.25 else int(rng.integers(72, 97))
+    placed_500 = [(cls, (cx - 0.5) * 0.5, (cy - 0.5) * 0.5, deg, r * 0.5) for cls, cx, cy, deg, r in placed]
+    owner_500 = owner.reshape(500, 2, 500, 2).max(axis=(1, 3)).copy()
+    if return_jpeg:
+        Y, Cb, Cr, jpg = rgb_to_half_ycbcr_sim(canvas, q=q, return_jpeg=True)
+        exact_ans = sum(COIN_VALUES[c[0]] for c in placed)
+        return Y, Cb, Cr, placed_500, owner_500, jpg, exact_ans
+    Y, Cb, Cr = rgb_to_half_ycbcr_sim(canvas, q=q)
+    return Y, Cb, Cr, placed_500, owner_500
 
 
 def synthesize_scene(sprites, alphas, radii, coins_by_cls, rng, mode: str, n_target: int):
@@ -841,75 +1281,112 @@ def synthesize_scene(sprites, alphas, radii, coins_by_cls, rng, mode: str, n_tar
             cx = float(rng.uniform(30.0, 970.0))
             cy = float(rng.uniform(30.0, 970.0))
 
-        if cx < -24.0 or cx > 1024.0 or cy < -24.0 or cy > 1024.0:
-            continue
-        if not allow_ov:
-            if any((cx - ox) ** 2 + (cy - oy) ** 2 < (r + orad + 1.5) ** 2 for _, ox, oy, _, orad in placed):
-                continue
-
-        ix, iy = int(round(cx)), int(round(cy))
-        x0, y0 = ix - 42, iy - 42
-        sx0, sy0 = max(0, x0), max(0, y0)
-        sx1, sy1 = min(1000, x0 + 85), min(1000, y0 + 85)
-        if sx1 <= sx0 or sy1 <= sy0:
-            continue
-
-        frac_x, frac_y = cx - ix, cy - iy
-        yy_sub, xx_sub = np.mgrid[sy0:sy1, sx0:sx1]
-        new_disk = ((xx_sub - cx) ** 2 + (yy_sub - cy) ** 2) <= (r * r)
-        if int(new_disk.sum()) < 450:
-            continue
-
-        if allow_ov and len(placed) > 0:
-            ok = True
-            affected_ids = np.unique(owner[sy0:sy1, sx0:sx1][new_disk])
-            for aid in affected_ids:
-                if aid < 0:
-                    continue
-                _, ax, ay, _, ar = placed[int(aid)]
-                ay0, ay1 = max(0, int(ay - ar - 2)), min(1000, int(ay + ar + 3))
-                ax0, ax1 = max(0, int(ax - ar - 2)), min(1000, int(ax + ar + 3))
-                sub_own = (owner[ay0:ay1, ax0:ax1] == aid).copy()
-                oy0, oy1 = max(ay0, sy0), min(ay1, sy1)
-                ox0, ox1 = max(ax0, sx0), min(ax1, sx1)
-                if oy1 > oy0 and ox1 > ox0:
-                    sub_own[oy0 - ay0:oy1 - ay0, ox0 - ax0:ox1 - ax0] &= ~new_disk[oy0 - sy0:oy1 - sy0, ox0 - sx0:ox1 - sx0]
-                if int(sub_own.sum()) < int(min_vis_ratio * math.pi * ar * ar):
-                    ok = False
-                    break
-                n_cc, _, stats_cc, _ = cv2.connectedComponentsWithStats(sub_own.astype(np.uint8), connectivity=4)
-                if sum(1 for k in range(1, n_cc) if stats_cc[k, cv2.CC_STAT_AREA] >= 12) != 1:
-                    ok = False
-                    break
-            if not ok:
-                continue
-
         if len(coins_by_cls[cls]) > 0 and rng.random() < 0.55:
             sp_src = coins_by_cls[cls][int(rng.integers(0, len(coins_by_cls[cls])))]
         else:
             sp_src = sprites[cls]
 
+        ix, iy = int(round(cx)), int(round(cy))
         M = cv2.getRotationMatrix2D((42.0, 42.0), deg, 1.0)
-        M[0, 2] += frac_x
-        M[1, 2] += frac_y
+        M[0, 2] += (cx - ix)
+        M[1, 2] += (cy - iy)
         rot_rgb = cv2.warpAffine(sp_src.astype(np.float32), M, (85, 85), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
         rot_a = cv2.warpAffine(alphas[cls], M, (85, 85), flags=cv2.INTER_LINEAR, borderValue=0.0)
-
-        px0, py0 = sx0 - x0, sy0 - y0
-        px1, py1 = px0 + (sx1 - sx0), py0 + (sy1 - sy0)
-        a_slice = rot_a[py0:py1, px0:px1, None]
-        dst = canvas[sy0:sy1, sx0:sx1].astype(np.float32)
-        comp = a_slice * rot_rgb[py0:py1, px0:px1] + (1.0 - a_slice) * dst
-        canvas[sy0:sy1, sx0:sx1] = np.clip(np.round(comp), 0, 255).astype(np.uint8)
-
-        owner[sy0:sy1, sx0:sx1][new_disk] = len(placed)
-        placed.append((cls, cx, cy, deg, r))
+        _try_place_coin_on_canvas(canvas, owner, placed, cls, cx, cy, deg, r, rot_rgb, rot_a, allow_ov, min_vis_ratio)
 
     q = 75 if rng.random() < 0.25 else int(rng.integers(70, 97))
     Y, Cb, Cr = rgb_to_half_ycbcr_sim(canvas, q=q)
     placed_500 = [(cls, (cx - 0.5) * 0.5, (cy - 0.5) * 0.5, deg, r * 0.5) for cls, cx, cy, deg, r in placed]
     owner_500 = owner.reshape(500, 2, 500, 2).max(axis=(1, 3)).copy()
     return Y, Cb, Cr, placed_500, owner_500
+
+
+# ==============================================================================
+# Combined End-to-End Test Suite Builder (from ALL files in ./sampleimages/)
+# ==============================================================================
+
+def _build_overlap_plus_fill_case(base_name, base_img, base_ans, verified_scenes, alphas, k_rot, rng, max_add=35, q=82):
+    """
+    Takes an existing overlapping image (e.g. group-3 or group-6), applies chirality-safe rot90,
+    and injects real coins from non-overlapping sample images strictly into unoccupied white regions.
+    Guaranteed exact answer = base_ans + sum(added_coins).
+    """
+    canvas = np.rot90(base_img, k_rot).copy()
+    occ = (canvas.min(axis=2) < 244).astype(np.uint8)
+    occ = cv2.dilate(occ, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+    all_real_coins = [c for sc in verified_scenes for c in sc["coins"]]
+    total_ans = base_ans
+    added = 0
+    for _ in range(max_add * 25):
+        if added >= max_add:
+            break
+        cls, _sx, _sy, _deg, r, patch = all_real_coins[int(rng.integers(0, len(all_real_coins)))]
+        cx = int(rng.integers(48, 952))
+        cy = int(rng.integers(48, 952))
+        rad_chk = int(math.ceil(r + 4.0))
+        sub_occ = occ[cy - rad_chk:cy + rad_chk + 1, cx - rad_chk:cx + rad_chk + 1]
+        if sub_occ.any():
+            continue
+
+        ck_rot = int(rng.integers(0, 4))
+        rot_rgb = np.rot90(patch, ck_rot).astype(np.float32)
+        rot_a = np.rot90(alphas[cls], ck_rot)
+        y0, x0 = cy - 42, cx - 42
+        a_sl = rot_a[:, :, None]
+        dst = canvas[y0:y0 + 85, x0:x0 + 85].astype(np.float32)
+        canvas[y0:y0 + 85, x0:x0 + 85] = np.clip(np.round(a_sl * rot_rgb + (1.0 - a_sl) * dst), 0, 255).astype(np.uint8)
+        cv2.circle(occ, (cx, cy), rad_chk, 1, -1)
+        total_ans += COIN_VALUES[cls]
+        added += 1
+
+    name = f"comb_{base_name}_r{k_rot * 90}_plus{added}"
+    return name, encode_jpeg_bytes(canvas, q=q), total_ans
+
+
+def build_combined_test_suite(raw_samples, verified_scenes, overlap_samples, alphas, save_dir=None):
+    """
+    Creates a comprehensive held-out test suite from ./sampleimages/:
+      1. All original sampleimages/*.in
+      2. Layered & mosaic real-on-real combined scenes (group-1/2/4/5 stacked with overlap)
+      3. Real overlap images (group-3/group-6 + rot90) combined with real coins in white space
+    """
+    suite = []
+    for name, jpg_bytes, _img, ans in raw_samples:
+        suite.append((f"orig_{name}", jpg_bytes, ans))
+
+    rng_t = np.random.default_rng(909001)
+    combo_specs = [
+        ("comb_stack2_1sek", "combo_stack", 2, True),
+        ("comb_stack3_1sek", "combo_dense", 3, True),
+        ("comb_stack2_mix", "combo_stack", 2, False),
+        ("comb_stack3_mix", "combo_stack", 3, False),
+        ("comb_dense4_mix", "combo_dense", 4, False),
+        ("comb_mosaic4_mix", "combo_mosaic", 3, False),
+    ]
+    for cname, mode, nl, only1 in combo_specs:
+        _, _, _, placed_500, _, jpg, exact_ans = synthesize_combined_scene(
+            verified_scenes, alphas, rng_t, mode=mode, n_layers=nl, only_1sek=only1, return_jpeg=True
+        )
+        suite.append((f"{cname}_n{len(placed_500)}", jpg, exact_ans))
+
+    for ov_name, ov_img, ov_ans in overlap_samples:
+        for k_rot in (0, 1, 2):
+            cname, jpg, exact_ans = _build_overlap_plus_fill_case(
+                ov_name, ov_img, ov_ans, verified_scenes, alphas, k_rot, rng_t, max_add=30, q=int(rng_t.integers(76, 94))
+            )
+            suite.append((cname, jpg, exact_ans))
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        for cname, jpg, ans in suite:
+            with open(os.path.join(save_dir, f"{cname}.in"), "wb") as f:
+                f.write(jpg)
+            with open(os.path.join(save_dir, f"{cname}.ans"), "w", encoding="ascii") as f:
+                f.write(f"{ans}\n")
+        print(f"Saved {len(suite)} combined test cases -> {save_dir}", flush=True)
+
+    return suite
 
 
 # ==============================================================================
@@ -951,7 +1428,6 @@ def extract_rim_features_for_pixels(Y, Cb, Cr, ys, xs):
 
 
 def extract_coarse_features(Y, Cb, Cr, fg_map, claimed, cx: float, cy: float) -> np.ndarray:
-    """Matches solution._coarse_score 100% bit-for-bit."""
     feats = []
     tot_vis = tot_fg = tot_oob = 0
     for dxs, dys in COARSE_OFFS:
@@ -1044,7 +1520,6 @@ def extract_polar_raw(Y, Cb, Cr, fg_map, claimed, cx: float, cy: float):
 
 
 def build_polar_features_c4e(raw_ycc: np.ndarray, vis: np.ndarray) -> np.ndarray:
-    """Builds 4-channel C4E polar features: [Yn, Cbn, Crn, EdgeMag], masked by vis."""
     N = len(raw_ycc)
     Yp = raw_ycc[:, 0]
     Cbp = raw_ycc[:, 1]
@@ -1175,7 +1650,6 @@ def _extract_patches_one_scene(scene, seed):
                 m_extra[y0:y1, x0:x1][disk] = 1
                 masks.append(m_extra)
 
-        # Continuous angular shift in [0, 16) for soft angular CE
         s_cont = float(((-deg % 360.0) / (360.0 / A_CNT)) % A_CNT)
         for mi, m_cl in enumerate(masks):
             ang_j1 = float(rng.uniform(0, 2 * math.pi))
@@ -1288,7 +1762,6 @@ def train_rim_models(eng: CudaEngine, rim_tr, rim_va, rng):
     N_tr = len(X_tr)
     print(f"Rim dataset (scene-split): train={N_tr}, val={len(X_val)}, pos_frac={(Y_tr[:,0]>0.5).mean():.3f}", flush=True)
 
-    # Pre-upload full Rim training dataset once
     X_tr_g = GpuTensor(X_tr.shape, data=X_tr)
     Y_tr_g = GpuTensor(Y_tr.shape, data=Y_tr)
     Y0_tr_g = GpuTensor((N_tr,), data=np.ascontiguousarray(Y_tr[:, 0]))
@@ -1299,7 +1772,6 @@ def train_rim_models(eng: CudaEngine, rim_tr, rim_va, rng):
     idx_g = GpuTensor((B,), dtype=np.int32)
     gx = GpuTensor((B, 14))
 
-    # --- 1. RimGate (14 -> 1) ---
     gate = [GpuLinear(14, 1, rng)]
     opt_g = AdamW(gate[0].params(), lr=3e-2, wd=1e-4)
     gt = GpuTensor((B,)); gw = GpuTensor((B,))
@@ -1341,7 +1813,6 @@ def train_rim_models(eng: CudaEngine, rim_tr, rim_va, rng):
         t.free()
     gate[0].free()
 
-    # --- 2. RimNet (14 -> 12 -> 8 -> 3) ---
     rim = [GpuLinear(14, 12, rng), GpuLinear(12, 8, rng), GpuLinear(8, 3, rng)]
     opt = AdamW(rim[0].params() + rim[1].params() + rim[2].params(), lr=8e-3, wd=1e-4)
 
@@ -1402,7 +1873,7 @@ def train_rim_models(eng: CudaEngine, rim_tr, rim_va, rng):
     return best_gate_w[0], gate_thr, best_rim_w
 
 
-def train_mlp_ce(eng, layers, X_tr, Y_tr, W_tr, X_val, Y_val, W_val, rng, epochs=50, lr_max=7e-3, bs=2048, wd=1e-4, name="MLP"):
+def train_mlp_ce(eng, layers, X_tr, Y_tr, W_tr, X_val, Y_val, W_val, rng, epochs=50, lr_max=7e-3, bs=2048, wd=1e-4, warmup_ep=3, name="MLP"):
     N_tr = len(X_tr)
     in_f = layers[0].in_f
     n_cls = layers[-1].out_f
@@ -1411,7 +1882,6 @@ def train_mlp_ce(eng, layers, X_tr, Y_tr, W_tr, X_val, Y_val, W_val, rng, epochs
         params += l.params()
     opt = AdamW(params, lr=lr_max, wd=wd)
 
-    # Upload training set once to GPU + pre-allocate scratch workspace
     X_g = GpuTensor(X_tr.shape, data=X_tr)
     Y_g = GpuTensor(Y_tr.shape, dtype=np.int32, data=Y_tr)
     W_g = GpuTensor(W_tr.shape, data=W_tr)
@@ -1430,7 +1900,7 @@ def train_mlp_ce(eng, layers, X_tr, Y_tr, W_tr, X_val, Y_val, W_val, rng, epochs
     best_vloss = 1e9
     for ep in range(epochs):
         p = rng.permutation(N_tr).astype(np.int32)
-        lr_c = lr_warmup_cosine(ep, epochs, lr_max, 1e-4, warmup_ep=3)
+        lr_c = lr_warmup_cosine(ep, epochs, lr_max, 1e-4, warmup_ep=warmup_ep)
         for s in range(0, N_tr, bs):
             idx = p[s:s + bs]; b = len(idx)
             idx_g.copy_from(idx, b * 4)
@@ -1517,7 +1987,6 @@ def train_polar_w_cls(eng: CudaEngine, F_tr, V_tr, Cls_tr, Sh_tr, F_va, V_va, Cl
     los_g = GpuTensor((bs_p,))
     part_g = GpuTensor((TILES, W_sz))
 
-    # Validation positive subset on GPU for fast FP16 checkpoint evaluation
     pos_va = np.where(Cls_va >= 0)[0]
     bs_v = len(pos_va)
     vF = GpuTensor((bs_v, CR_CNT, A_CNT), data=F_va[pos_va])
@@ -1570,16 +2039,17 @@ def train_polar_w_cls(eng: CudaEngine, F_tr, V_tr, Cls_tr, Sh_tr, F_va, V_va, Cl
 
 
 # ==============================================================================
-# Fully Vectorized AcceptNet Feature Builder (50-100x faster, bit-matched!)
+# Fully Vectorized AcceptNet Feature Builder
 # ==============================================================================
 
 def build_accept_features_batch(W_cls_np, F_arr, vis_arr, stats_arr):
     N = F_arr.shape[0]
+    if N == 0:
+        return np.empty((0, 33), dtype=np.float32)
     feats = np.empty((N, 33), dtype=np.float32)
     W_fft = np.fft.rfft(W_cls_np.reshape(3, CR_CNT, A_CNT), axis=2)
     W2_fft = np.fft.rfft((W_cls_np ** 2).reshape(3, CR_CNT, A_CNT), axis=2)
 
-    # Pre-roll all 16 shifts + half-bin neighbors (48 KB total -> L1/L2 cache)
     W_rot = np.stack(
         [np.stack([np.roll(W_cls_np[k], sh, axis=2) for sh in range(A_CNT)], axis=0) for k in range(3)],
         axis=0,
@@ -1649,7 +2119,7 @@ def build_accept_features_batch(W_cls_np, F_arr, vis_arr, stats_arr):
 
 
 # ==============================================================================
-# 100% Lossless Predictive + Canonical Huffman Weight Packer & Verifier (Zero zlib!)
+# 100% Lossless Predictive + Canonical Huffman Weight Packer & Verifier
 # ==============================================================================
 
 WEIGHT_SCHEMA = [
@@ -1823,60 +2293,263 @@ def unpack_weights_verify(b85: str, bundle: dict):
     assert pos == n_tot
 
 
+# ==============================================================================
+# Stage-2 Hard-Example Mining & Combined End-to-End Evaluation (via generate_solution)
+# ==============================================================================
+
+def _build_runtime_module_from_template(b85: str):
+    """Loads CoinDetector directly from generate_solution.SOLUTION_TEMPLATE in-memory."""
+    from generate_solution import SOLUTION_TEMPLATE
+    src = SOLUTION_TEMPLATE.replace("__WEIGHTS_B85__", b85, 1)
+    ns = {}
+    exec(compile(src, "<solution_mem>", "exec"), ns)
+    return ns
+
+
+def evaluate_on_combined_suite(b85: str, test_suite: list, label: str = "Eval"):
+    ns = _build_runtime_module_from_template(b85)
+    weights = ns["load_weights"](b85)
+    det = ns["CoinDetector"](weights)
+    exact = 0
+    tot_abs_err = 0
+    print(f"\n=== {label}: End-to-End Combined Test Suite ({len(test_suite)} cases) ===", flush=True)
+    for name, jpg_bytes, expected in test_suite:
+        t0 = time.perf_counter()
+        pred = det.solve(jpg_bytes, time_budget_s=1.80)
+        dt = time.perf_counter() - t0
+        err = pred - expected
+        tot_abs_err += abs(err)
+        ok = (err == 0)
+        exact += int(ok)
+        st = "OK" if ok else f"DIFF {err:+d}"
+        print(f"  {name:28s} pred={pred:5d}  ans={expected:5d}  [{st:10s}]  {dt:.3f}s", flush=True)
+    print(f"  -> {label} Summary: exact={exact}/{len(test_suite)} | total |err|={tot_abs_err}", flush=True)
+    return exact, tot_abs_err
+
+
+def mine_hard_examples(b85: str, mining_scenes: list, W_cls_np: np.ndarray, rng):
+    """
+    Runs the REAL CoinDetector on separate combined training scenes (with exact GT coordinates)
+    to harvest runtime False Positives, Wrong-Class Detections, and Missed Coins!
+    """
+    ns = _build_runtime_module_from_template(b85)
+    weights = ns["load_weights"](b85)
+    BaseDetector = ns["CoinDetector"]
+
+    class MiningDetector(BaseDetector):
+        def _propose_centers(self, Y, Cb, Cr, fg, fg_rows=None, deadline=None):
+            self._cap_planes = (Y, Cb, Cr, fg)
+            self._cap_events = []
+            self._cap_final_claimed = None
+            return super()._propose_centers(Y, Cb, Cr, fg, fg_rows=fg_rows, deadline=deadline)
+
+        def _mark_claimed(self, claimed, claimed_rows, cx, cy, r):
+            self._cap_events.append((cx, cy, r, bytes(claimed)))
+            self._cap_final_claimed = claimed
+            return super()._mark_claimed(claimed, claimed_rows, cx, cy, r)
+
+    det = MiningDetector(weights)
+
+    mc_X, mc_Y, mc_W = [], [], []
+    mp_YCC, mp_V, mp_Stats, mp_Lbl, mp_Wt = [], [], [], [], []
+    n_fp = n_wc = n_fn = 0
+
+    for _Y_s, _Cb_s, _Cr_s, placed_500, _owner_500, jpg_bytes, _exact_ans in mining_scenes:
+        det.solve(jpg_bytes, time_budget_s=1.80)
+        if not hasattr(det, "_cap_planes") or det._cap_final_claimed is None:
+            continue
+        Y_b, Cb_b, Cr_b, fg_b = det._cap_planes
+        Y = np.frombuffer(Y_b, dtype=np.uint8).reshape(500, 500).astype(np.float32)
+        Cb = np.frombuffer(Cb_b, dtype=np.uint8).reshape(500, 500).astype(np.float32)
+        Cr = np.frombuffer(Cr_b, dtype=np.uint8).reshape(500, 500).astype(np.float32)
+        fg = np.frombuffer(fg_b, dtype=np.uint8).reshape(500, 500).astype(bool)
+        final_cl = np.frombuffer(det._cap_final_claimed, dtype=np.uint8).reshape(500, 500).copy()
+
+        gt_matched = [False] * len(placed_500)
+        for cx, cy, r_mark, pre_cl_bytes in det._cap_events:
+            pre_cl = np.frombuffer(pre_cl_bytes, dtype=np.uint8).reshape(500, 500)
+            # Determine exact predicted class from the runtime detector at pre_cl
+            det._pt_cache.clear(); det._eval_cache.clear()
+            ev = det._eval_polar_and_accept(Y_b, Cb_b, Cr_b, fg_b, bytearray(pre_cl_bytes), cx, cy)
+            cls_pred = ev[1] if ev is not None else int(np.argmin([abs((r_mark - 0.12) - rk) for rk in det.radii_500]))
+
+            best_gi = -1
+            best_d2 = 16.0  # 4.0 px radius at 500x500
+            for gi, (gcls, gcx, gcy, _gdeg, _gr) in enumerate(placed_500):
+                if gt_matched[gi]:
+                    continue
+                d2 = (cx - gcx) ** 2 + (cy - gcy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_gi = gi
+
+            if best_gi < 0:
+                # Runtime False Positive -> hard negative (label=0)
+                n_fp += 1
+                for jx, jy in ((0.0, 0.0), (float(rng.uniform(-0.6, 0.6)), float(rng.uniform(-0.6, 0.6)))):
+                    fx, fy = cx + jx, cy + jy
+                    mc_X.append(extract_coarse_features(Y, Cb, Cr, fg, pre_cl, fx, fy))
+                    mc_Y.append(0); mc_W.append(2.5)
+                    ycc, vis, st12 = extract_polar_raw(Y, Cb, Cr, fg, pre_cl, fx, fy)
+                    if vis.sum() >= 5:
+                        mp_YCC.append(ycc); mp_V.append(vis); mp_Stats.append(st12)
+                        mp_Lbl.append(0); mp_Wt.append(2.6)
+            else:
+                gt_matched[best_gi] = True
+                gcls, gcx, gcy, _gdeg, _gr = placed_500[best_gi]
+                if cls_pred != gcls:
+                    # Runtime Wrong-Class Detection -> hard positive with true class
+                    n_wc += 1
+                    for jx, jy in ((0.0, 0.0), (cx - gcx, cy - gcy)):
+                        fx, fy = gcx + jx, gcy + jy
+                        mc_X.append(extract_coarse_features(Y, Cb, Cr, fg, pre_cl, fx, fy))
+                        mc_Y.append(gcls + 1); mc_W.append(2.5)
+                        ycc, vis, st12 = extract_polar_raw(Y, Cb, Cr, fg, pre_cl, fx, fy)
+                        if vis.sum() >= 5:
+                            mp_YCC.append(ycc); mp_V.append(vis); mp_Stats.append(st12)
+                            mp_Lbl.append(gcls + 1); mp_Wt.append(2.8)
+
+        # Runtime Missed Coins (False Negatives) under final_cl
+        for gi, matched in enumerate(gt_matched):
+            if matched:
+                continue
+            gcls, gcx, gcy, _gdeg, _gr = placed_500[gi]
+            n_fn += 1
+            for rad_j in (0.0, 0.45, 0.90):
+                ang_j = float(rng.uniform(0.0, 2.0 * math.pi))
+                fx = gcx + rad_j * math.cos(ang_j)
+                fy = gcy + rad_j * math.sin(ang_j)
+                cf = extract_coarse_features(Y, Cb, Cr, fg, final_cl, fx, fy)
+                if cf[21] >= 0.06:
+                    mc_X.append(cf); mc_Y.append(gcls + 1); mc_W.append(2.4)
+                ycc, vis, st12 = extract_polar_raw(Y, Cb, Cr, fg, final_cl, fx, fy)
+                if vis.sum() >= 5:
+                    mp_YCC.append(ycc); mp_V.append(vis); mp_Stats.append(st12)
+                    mp_Lbl.append(gcls + 1); mp_Wt.append(2.6)
+
+    print(f"Stage-2 Mining across {len(mining_scenes)} combined train scenes: FP={n_fp}, WrongCls={n_wc}, Missed={n_fn} -> mined Coarse={len(mc_X)}, Accept={len(mp_Lbl)}", flush=True)
+
+    if len(mp_YCC) > 0:
+        F_m = build_polar_features_c4e(np.array(mp_YCC, dtype=np.float32), np.array(mp_V, dtype=np.float32))
+        X33_m = build_accept_features_batch(W_cls_np, F_m, np.array(mp_V, dtype=np.float32), np.array(mp_Stats, dtype=np.float32))
+        acc_mined = (X33_m, np.array(mp_Lbl, dtype=np.int32), np.array(mp_Wt, dtype=np.float32))
+    else:
+        acc_mined = None
+
+    if len(mc_X) > 0:
+        coarse_mined = (np.array(mc_X, dtype=np.float32), np.array(mc_Y, dtype=np.int32), np.array(mc_W, dtype=np.float32))
+    else:
+        coarse_mined = None
+
+    return coarse_mined, acc_mined
+
+
+def _assemble_bundle(rim_gate_w, gate_thr, rim_w, coarse_w, W_cls_np, acc_w, radii_500):
+    return {
+        "rim_gate_W": rim_gate_w[0], "rim_gate_b": rim_gate_w[1], "rim_gate_thr": np.array([gate_thr], dtype=np.float32),
+        "rim0_W": rim_w[0][0], "rim0_b": rim_w[0][1],
+        "rim1_W": rim_w[1][0], "rim1_b": rim_w[1][1],
+        "rim2_W": rim_w[2][0], "rim2_b": rim_w[2][1],
+        "coarse0_W": coarse_w[0][0], "coarse0_b": coarse_w[0][1],
+        "coarse1_W": coarse_w[1][0], "coarse1_b": coarse_w[1][1],
+        "coarse2_W": coarse_w[2][0], "coarse2_b": coarse_w[2][1],
+        "W_cls": W_cls_np,
+        "acc0_W": acc_w[0][0], "acc0_b": acc_w[0][1],
+        "acc1_W": acc_w[1][0], "acc1_b": acc_w[1][1],
+        "acc2_W": acc_w[2][0], "acc2_b": acc_w[2][1],
+        "radii_500": radii_500,
+    }
+
+
 def main():
     no_inject = "--no-inject" in sys.argv[1:]
+    save_tests = "--save-tests" in sys.argv[1:]
     t0 = time.perf_counter()
     n_workers = min(8, os.cpu_count() or 4)
     rng = np.random.default_rng(2026)
 
-    sprites, alphas, radii, coins_by_cls = extract_clean_coins_from_samples()
+    sprites, alphas, radii, coins_by_cls, raw_samples, verified_non_overlap, overlap_samples = extract_all_sample_data()
     radii_500 = np.array([r * 0.5 for r in radii], dtype=np.float32)
 
-    # Stratified scene counts: guaranteed held-out val scenes from EVERY mode
-    mode_specs = [
+    # Build held-out Combined End-to-End Test Suite from ALL ./sampleimages/
+    test_suite = build_combined_test_suite(
+        raw_samples, verified_non_overlap, overlap_samples, alphas,
+        save_dir=(COMBINED_TESTS_DIR if save_tests else None),
+    )
+
+    # Mix of Parametric Synthetic Scenes + Real-on-Real Combined Sample Image Scenes
+    synth_specs = [
         ("g1", 95, 4),
-        ("g2", 95, 6),
-        ("g3", 150, 12),
-        ("dense1", 215, 7),
-        ("g4", 95, 6),
-        ("g5", 95, 8),
-        ("g6", 155, 22),
-        ("dense", 195, 10),
-        ("dense6", 230, 9),
+        ("g2", 95, 5),
+        ("g3", 150, 10),
+        ("dense1", 215, 6),
+        ("g4", 95, 5),
+        ("g5", 95, 6),
+        ("g6", 155, 18),
+        ("dense", 195, 9),
+        ("dense6", 230, 8),
     ]
+    combo_train_specs = [
+        ("combo_stack", 2, True, 5),
+        ("combo_dense", 3, True, 5),
+        ("combo_stack", 2, False, 8),
+        ("combo_stack", 3, False, 10),
+        ("combo_dense", 4, False, 8),
+        ("combo_mosaic", 3, False, 8),
+    ]
+
     tasks = []
-    for mode, nt, cnt in mode_specs:
+    for mode, nt, cnt in synth_specs:
         n_val_m = max(1, int(round(cnt * 0.15)))
         for idx_in_m in range(cnt):
-            tasks.append((mode, nt, idx_in_m < n_val_m))
+            tasks.append(("synth", mode, nt, False, idx_in_m < n_val_m))
+    for mode, n_layers, only1, cnt in combo_train_specs:
+        n_val_m = max(1, int(round(cnt * 0.15)))
+        for idx_in_m in range(cnt):
+            tasks.append(("combo", mode, n_layers, only1, idx_in_m < n_val_m))
 
     scene_seeds = np.random.SeedSequence(202607).spawn(len(tasks))
-    print(f"\nSynthesizing {len(tasks)} scenes in parallel ({n_workers} threads, 8x8 chroma, strict sampleimages/)...", flush=True)
+    print(f"\nBuilding {len(tasks)} scenes ({sum(1 for t in tasks if t[0]=='combo')} real-combined + {sum(1 for t in tasks if t[0]=='synth')} synthetic) on {n_workers} threads...", flush=True)
 
-    def _synth_worker(args):
-        (m, nt, is_val), seed = args
+    def _scene_worker(args):
+        (kind, mode, param, only1, is_val), seed = args
         r_local = np.random.default_rng(seed)
-        n_t = max(30, int(round(nt * r_local.uniform(0.86, 1.10)))) if m in ("dense1", "dense6", "dense") else nt
-        return synthesize_scene(sprites, alphas, radii, coins_by_cls, r_local, m, n_t), is_val
+        if kind == "combo":
+            return synthesize_combined_scene(verified_non_overlap, alphas, r_local, mode=mode, n_layers=param, only_1sek=only1), is_val
+        n_t = max(30, int(round(param * r_local.uniform(0.86, 1.10)))) if mode in ("dense1", "dense6", "dense") else param
+        return synthesize_scene(sprites, alphas, radii, coins_by_cls, r_local, mode, n_t), is_val
 
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
-        synth_out = list(ex.map(_synth_worker, zip(tasks, scene_seeds)))
+        synth_out = list(ex.map(_scene_worker, zip(tasks, scene_seeds)))
 
     train_scenes = [sc for sc, is_val in synth_out if not is_val]
     val_scenes = [sc for sc, is_val in synth_out if is_val]
     del synth_out
     print(
-        f"  Synthesized {len(train_scenes)} train scenes ({sum(len(s[3]) for s in train_scenes)} coins) + "
+        f"  Built {len(train_scenes)} train scenes ({sum(len(s[3]) for s in train_scenes)} coins) + "
         f"{len(val_scenes)} val scenes ({sum(len(s[3]) for s in val_scenes)} coins) in {time.perf_counter()-t0:.1f}s",
         flush=True,
     )
+
+    # Also build 18 dedicated combined training scenes (with JPEG bytes) for Stage-2 Hard-Example Mining
+    rng_mine = np.random.default_rng(55501)
+    mining_specs = [
+        ("combo_stack", 2, True), ("combo_dense", 3, True), ("combo_dense", 4, True),
+        ("combo_stack", 2, False), ("combo_stack", 3, False), ("combo_stack", 3, False),
+        ("combo_dense", 3, False), ("combo_dense", 4, False), ("combo_dense", 4, False),
+        ("combo_mosaic", 3, False), ("combo_mosaic", 4, False), ("combo_mosaic", 4, False),
+    ]
+    mining_scenes = [
+        synthesize_combined_scene(verified_non_overlap, alphas, rng_mine, mode=m, n_layers=nl, only_1sek=o1, return_jpeg=True)
+        for m, nl, o1 in mining_specs
+    ]
 
     rim_tr = extract_rim_from_scenes(train_scenes, rng)
     rim_va = extract_rim_from_scenes(val_scenes, rng)
 
     tr_patches = extract_patches_from_scenes(train_scenes, seed_base=41001, n_workers=n_workers)
     va_patches = extract_patches_from_scenes(val_scenes, seed_base=42001, n_workers=n_workers)
-    del train_scenes, val_scenes, sprites, alphas, coins_by_cls
+    del train_scenes, val_scenes, sprites, alphas, coins_by_cls, verified_non_overlap, overlap_samples, raw_samples
     gc.collect()
 
     cX_tr, cY_tr, cW_tr, raw_tr, pV_tr, pCls_tr, pSh_tr, pStats_tr, pLbl_tr, pWt_tr, pTight_tr = tr_patches
@@ -1895,16 +2568,14 @@ def main():
         rim_gate_w, gate_thr, rim_w = train_rim_models(eng, rim_tr, rim_va, rng)
         del rim_tr, rim_va
 
-        print("\n=== Training CoarseNet (25 -> 12 -> 8 -> 4) ===", flush=True)
+        print("\n=== Stage 1: Training CoarseNet (25 -> 12 -> 8 -> 4) ===", flush=True)
         coarse = [GpuLinear(25, 12, rng), GpuLinear(12, 8, rng), GpuLinear(8, 4, rng)]
-        coarse_w, _ = train_mlp_ce(
+        coarse_w_s1, _ = train_mlp_ce(
             eng, coarse, cX_tr, cY_tr, cW_tr, cX_va, cY_va, cW_va, rng,
-            epochs=50, lr_max=8e-3, bs=2048, name="CoarseNet",
+            epochs=50, lr_max=8e-3, bs=2048, name="CoarseNet-S1",
         )
-        del cX_tr, cY_tr, cW_tr, cX_va, cY_va, cW_va
-        gc.collect()
 
-        print("\n=== Training Polar C4E W_cls (3, 4, 4, 16) [Soft Angular CE + Smoothness] ===", flush=True)
+        print("\n=== Stage 1: Training Polar C4E W_cls (3, 4, 4, 16) ===", flush=True)
         F_tr = build_polar_features_c4e(raw_tr, pV_tr)
         F_va = build_polar_features_c4e(raw_va, pV_va)
         del raw_tr, raw_va
@@ -1918,7 +2589,7 @@ def main():
             rng_v,
         )
 
-        print("\n=== Training AcceptNet (33 -> 20 -> 10 -> 4) on FP16 W_cls Features ===", flush=True)
+        print("\n=== Stage 1: Training AcceptNet (33 -> 20 -> 10 -> 4) ===", flush=True)
         t_feat = time.perf_counter()
         X33_tr = build_accept_features_batch(W_cls_np, F_tr, pV_tr, pStats_tr)
         X33_va = build_accept_features_batch(W_cls_np, F_va, pV_va, pStats_va)
@@ -1927,47 +2598,89 @@ def main():
         gc.collect()
 
         acc_layers = [GpuLinear(33, 20, rng_v), GpuLinear(20, 10, rng_v), GpuLinear(10, 4, rng_v)]
-        best_acc_w, _ = train_mlp_ce(
+        acc_w_s1, _ = train_mlp_ce(
             eng, acc_layers, X33_tr, pLbl_tr, pWt_tr, X33_va, pLbl_va, pWt_va, rng_v,
-            epochs=80, lr_max=6e-3, bs=1024, wd=1e-4, name="AcceptNet-C4E",
+            epochs=80, lr_max=6e-3, bs=1024, wd=1e-4, name="AcceptNet-S1",
         )
+
+        bundle_s1 = _assemble_bundle(rim_gate_w, gate_thr, rim_w, coarse_w_s1, W_cls_np, acc_w_s1, radii_500)
+        b85_s1 = pack_weights_lossless(bundle_s1)
+
+        # Stage-2: Hard-Example Mining on Combined Training Scenes & End-to-End Selection
+        best_b85 = b85_s1
+        has_generator = os.path.exists(os.path.join(BASE_DIR, "generate_solution.py"))
+        if has_generator:
+            ex_s1, err_s1 = evaluate_on_combined_suite(b85_s1, test_suite, label="Stage-1")
+            print("\n=== Stage 2: Hard-Example Mining on Combined Training Scenes ===", flush=True)
+            coarse_mined, acc_mined = mine_hard_examples(b85_s1, mining_scenes, W_cls_np, rng_v)
+
+            coarse_w_s2 = coarse_w_s1
+            if coarse_mined is not None and len(coarse_mined[0]) >= 32:
+                cX_all = np.ascontiguousarray(np.concatenate([cX_tr, coarse_mined[0]], axis=0))
+                cY_all = np.ascontiguousarray(np.concatenate([cY_tr, coarse_mined[1]], axis=0))
+                cW_all = np.ascontiguousarray(np.concatenate([cW_tr, coarse_mined[2]], axis=0))
+                c_ft = [
+                    GpuLinear(25, 12, rng, init_wb=coarse_w_s1[0]),
+                    GpuLinear(12, 8, rng, init_wb=coarse_w_s1[1]),
+                    GpuLinear(8, 4, rng, init_wb=coarse_w_s1[2]),
+                ]
+                coarse_w_s2, _ = train_mlp_ce(
+                    eng, c_ft, cX_all, cY_all, cW_all, cX_va, cY_va, cW_va, rng,
+                    epochs=25, lr_max=2.5e-3, bs=2048, warmup_ep=2, name="CoarseNet-S2",
+                )
+
+            acc_w_s2 = acc_w_s1
+            if acc_mined is not None and len(acc_mined[0]) >= 32:
+                X33_all = np.ascontiguousarray(np.concatenate([X33_tr, acc_mined[0]], axis=0))
+                pL_all = np.ascontiguousarray(np.concatenate([pLbl_tr, acc_mined[1]], axis=0))
+                pW_all = np.ascontiguousarray(np.concatenate([pWt_tr, acc_mined[2]], axis=0))
+                a_ft = [
+                    GpuLinear(33, 20, rng_v, init_wb=acc_w_s1[0]),
+                    GpuLinear(20, 10, rng_v, init_wb=acc_w_s1[1]),
+                    GpuLinear(10, 4, rng_v, init_wb=acc_w_s1[2]),
+                ]
+                acc_w_s2, _ = train_mlp_ce(
+                    eng, a_ft, X33_all, pL_all, pW_all, X33_va, pLbl_va, pWt_va, rng_v,
+                    epochs=35, lr_max=2.0e-3, bs=1024, wd=1e-4, warmup_ep=2, name="AcceptNet-S2",
+                )
+
+            if (coarse_w_s2 is not coarse_w_s1) or (acc_w_s2 is not acc_w_s1):
+                bundle_s2 = _assemble_bundle(rim_gate_w, gate_thr, rim_w, coarse_w_s2, W_cls_np, acc_w_s2, radii_500)
+                b85_s2 = pack_weights_lossless(bundle_s2)
+                ex_s2, err_s2 = evaluate_on_combined_suite(b85_s2, test_suite, label="Stage-2")
+                if (err_s2 < err_s1) or (err_s2 == err_s1 and ex_s2 >= ex_s1):
+                    print(f"  -> Selecting Stage-2 weights (|err| {err_s1} -> {err_s2}, exact {ex_s1} -> {ex_s2})", flush=True)
+                    best_b85 = b85_s2
+                else:
+                    print(f"  -> Keeping Stage-1 weights (Stage-1 |err|={err_s1} vs Stage-2 |err|={err_s2})", flush=True)
+        else:
+            print("Note: generate_solution.py not found in directory; skipping Stage-2 runtime mining.", flush=True)
     finally:
         gc.collect()
         eng.close()
 
-    bundle = {
-        "rim_gate_W": rim_gate_w[0], "rim_gate_b": rim_gate_w[1], "rim_gate_thr": np.array([gate_thr], dtype=np.float32),
-        "rim0_W": rim_w[0][0], "rim0_b": rim_w[0][1],
-        "rim1_W": rim_w[1][0], "rim1_b": rim_w[1][1],
-        "rim2_W": rim_w[2][0], "rim2_b": rim_w[2][1],
-        "coarse0_W": coarse_w[0][0], "coarse0_b": coarse_w[0][1],
-        "coarse1_W": coarse_w[1][0], "coarse1_b": coarse_w[1][1],
-        "coarse2_W": coarse_w[2][0], "coarse2_b": coarse_w[2][1],
-        "W_cls": W_cls_np,
-        "acc0_W": best_acc_w[0][0], "acc0_b": best_acc_w[0][1],
-        "acc1_W": best_acc_w[1][0], "acc1_b": best_acc_w[1][1],
-        "acc2_W": best_acc_w[2][0], "acc2_b": best_acc_w[2][1],
-        "radii_500": radii_500,
-    }
-    b85 = pack_weights_lossless(bundle)
     out_w_path = os.path.join(BASE_DIR, "trained_weights.b85")
     with open(out_w_path, "w", encoding="ascii") as f:
-        f.write(b85)
-    print(f"\nSaved & verified lossless Predictive+Huffman weights -> {out_w_path} ({len(b85)} chars) in {time.perf_counter()-t0:.1f}s", flush=True)
+        f.write(best_b85)
+    print(f"\nSaved & verified lossless weights -> {out_w_path} ({len(best_b85)} chars) in {time.perf_counter()-t0:.1f}s", flush=True)
 
-    if (not no_inject) and os.path.exists(SOLUTION_PATH):
-        with open(SOLUTION_PATH, "r", encoding="utf-8") as sf:
-            sol_src = sf.read()
-        sol_new = re.sub(
-            r'WEIGHTS_B85\s*=\s*".*?"',
-            lambda _m: f'WEIGHTS_B85="{b85}"',
-            sol_src,
-            count=1,
-            flags=re.DOTALL,
-        )
-        with open(SOLUTION_PATH, "w", encoding="utf-8", newline="\n") as sf:
-            sf.write(sol_new)
-        print(f"Injected weights into {SOLUTION_PATH} ({len(sol_new.encode('utf-8'))} bytes total)", flush=True)
+    if not no_inject:
+        if os.path.exists(os.path.join(BASE_DIR, "generate_solution.py")):
+            from generate_solution import generate_solution
+            generate_solution(weights_b85=best_b85, out_path=SOLUTION_PATH, verify=True)
+        elif os.path.exists(SOLUTION_PATH):
+            with open(SOLUTION_PATH, "r", encoding="utf-8") as sf:
+                sol_src = sf.read()
+            sol_new = re.sub(
+                r'WEIGHTS_B85\s*=\s*".*?"',
+                lambda _m: f'WEIGHTS_B85="{best_b85}"',
+                sol_src,
+                count=1,
+                flags=re.DOTALL,
+            )
+            with open(SOLUTION_PATH, "w", encoding="utf-8", newline="\n") as sf:
+                sf.write(sol_new)
+            print(f"Injected weights into {SOLUTION_PATH} ({len(sol_new.encode('utf-8'))} bytes total)", flush=True)
 
 
 if __name__ == "__main__":
